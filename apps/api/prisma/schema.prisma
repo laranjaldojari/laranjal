@@ -1,0 +1,536 @@
+// ============================================================================
+//  Plataforma Municipal Integrada — Prefeitura de Laranjal do Jari
+//  Schema NUCLEAR (Etapa 1). Cada novo módulo (RH, Finanças, Saúde, etc.)
+//  estende este schema seguindo EXATAMENTE as mesmas convenções:
+//    - id: CUID
+//    - createdAt / updatedAt
+//    - deletedAt (soft delete — nunca DELETE físico)
+//    - todos os eventos relevantes registrados em AuditLog
+// ============================================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ----------------------------------------------------------------------------
+//  IDENTIDADE
+// ----------------------------------------------------------------------------
+
+model User {
+  id            String    @id @default(cuid())
+  nome          String
+  email         String    @unique
+  cpf           String    @unique
+  matricula     String?   @unique // servidores
+  senhaHash     String
+  ativo         Boolean   @default(true)
+
+  // MFA / 2FA
+  mfaAtivo      Boolean   @default(false)
+  mfaSecret     String?   // segredo TOTP cifrado
+
+  // Vínculo organizacional
+  secretariaId  String?
+  secretaria    Secretaria?  @relation(fields: [secretariaId], references: [id])
+  departamentoId String?
+  departamento  Departamento? @relation(fields: [departamentoId], references: [id])
+
+  // Acesso
+  roles            UserRole[]
+  permissoes       UserPermission[]   // permissões individuais (sobrescrevem o papel)
+  refreshTokens    RefreshToken[]
+  auditorias       AuditLog[]
+  anexos           Attachment[]
+  notificacoes     Notification[]
+  transicoesWorkflow WorkflowTransition[]
+  solicitacoesCompra SolicitacaoCompra[]
+  processosAbertos    ProcessoEletronico[]
+  tramitacoesProcesso TramitacaoProcesso[]
+  atosProcesso        AtoProcesso[]
+
+  ultimoLogin   DateTime?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+  deletedAt     DateTime?
+
+  @@index([secretariaId])
+  @@index([deletedAt])
+  @@map("users")
+}
+
+model RefreshToken {
+  id            String    @id @default(cuid())
+  userId        String
+  user          User      @relation(fields: [userId], references: [id])
+  tokenHash     String    @unique // armazenamos o hash, nunca o token cru
+  expiraEm      DateTime
+  revogadoEm    DateTime?
+
+  // Contexto de segurança (exigido pela especificação)
+  ip            String?
+  userAgent     String?
+  dispositivo   String?
+
+  createdAt     DateTime  @default(now())
+
+  @@index([userId])
+  @@map("refresh_tokens")
+}
+
+// ----------------------------------------------------------------------------
+//  RBAC GRANULAR
+//  Permissão = (recurso, ação). Ex.: ("rh.servidores", "EDITAR")
+//  Papéis agregam permissões; usuários recebem papéis e podem ter
+//  permissões individuais (concessão ou negação explícita).
+// ----------------------------------------------------------------------------
+
+enum AcaoPermissao {
+  VISUALIZAR
+  CADASTRAR
+  EDITAR
+  EXCLUIR
+  APROVAR
+  PUBLICAR
+  ASSINAR
+  EXPORTAR
+  IMPRIMIR
+  ADMINISTRAR
+}
+
+model Permission {
+  id          String         @id @default(cuid())
+  recurso     String         // identificador da tela/recurso, ex.: "financas.empenhos"
+  acao        AcaoPermissao
+  descricao   String?
+
+  roles       RolePermission[]
+  usuarios    UserPermission[]
+
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  @@unique([recurso, acao])
+  @@map("permissions")
+}
+
+model Role {
+  id          String   @id @default(cuid())
+  nome        String   @unique // "Administrador Geral", "Prefeito", "Secretário"...
+  descricao   String?
+  sistema     Boolean  @default(false) // papéis de sistema não podem ser excluídos
+
+  permissoes  RolePermission[]
+  usuarios    UserRole[]
+  workflowSteps WorkflowStep[]
+
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  deletedAt   DateTime?
+
+  @@map("roles")
+}
+
+model RolePermission {
+  roleId        String
+  role          Role        @relation(fields: [roleId], references: [id])
+  permissionId  String
+  permission    Permission  @relation(fields: [permissionId], references: [id])
+
+  @@id([roleId, permissionId])
+  @@map("role_permissions")
+}
+
+model UserRole {
+  userId  String
+  user    User  @relation(fields: [userId], references: [id])
+  roleId  String
+  role    Role  @relation(fields: [roleId], references: [id])
+
+  @@id([userId, roleId])
+  @@map("user_roles")
+}
+
+// Concessão (efeito GRANT) ou negação (efeito DENY) individual.
+// DENY sempre vence sobre qualquer GRANT herdado de papéis.
+enum EfeitoPermissao {
+  GRANT
+  DENY
+}
+
+model UserPermission {
+  userId        String
+  user          User        @relation(fields: [userId], references: [id])
+  permissionId  String
+  permission    Permission  @relation(fields: [permissionId], references: [id])
+  efeito        EfeitoPermissao @default(GRANT)
+
+  @@id([userId, permissionId])
+  @@map("user_permissions")
+}
+
+// ----------------------------------------------------------------------------
+//  ORGANIZAÇÃO (Organograma)
+// ----------------------------------------------------------------------------
+
+model Secretaria {
+  id            String   @id @default(cuid())
+  nome          String
+  sigla         String   @unique
+  responsavel   String?
+
+  departamentos Departamento[]
+  usuarios      User[]
+  solicitacoesCompra SolicitacaoCompra[]
+
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+  deletedAt     DateTime?
+
+  @@map("secretarias")
+}
+
+model Departamento {
+  id            String   @id @default(cuid())
+  nome          String
+  secretariaId  String
+  secretaria    Secretaria @relation(fields: [secretariaId], references: [id])
+
+  // auto-relacionamento para hierarquia do organograma
+  paiId         String?
+  pai           Departamento?  @relation("Hierarquia", fields: [paiId], references: [id])
+  filhos        Departamento[] @relation("Hierarquia")
+
+  usuarios      User[]
+
+  processosAtuais ProcessoEletronico[] @relation("SetorAtual")
+  tramitacoesDe   TramitacaoProcesso[] @relation("TramitacaoDe")
+  tramitacoesPara TramitacaoProcesso[] @relation("TramitacaoPara")
+
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+  deletedAt     DateTime?
+
+  @@index([secretariaId])
+  @@map("departamentos")
+}
+
+// ----------------------------------------------------------------------------
+//  AUDITORIA (transversal a TODOS os módulos)
+// ----------------------------------------------------------------------------
+
+model AuditLog {
+  id          String   @id @default(cuid())
+  userId      String?
+  user        User?    @relation(fields: [userId], references: [id])
+
+  acao        String   // "CREATE", "UPDATE", "DELETE", "LOGIN", "EXPORT"...
+  recurso     String   // entidade afetada, ex.: "User", "Empenho"
+  recursoId   String?
+  antes       Json?    // estado anterior (para UPDATE/DELETE)
+  depois      Json?    // estado novo
+
+  ip          String?
+  userAgent   String?
+
+  createdAt   DateTime @default(now())
+
+  @@index([userId])
+  @@index([recurso, recursoId])
+  @@index([createdAt])
+  @@map("audit_logs")
+}
+
+// ============================================================================
+//  NÚCLEO TRANSVERSAL (Etapa 4) — serviços compartilhados por todos os módulos
+// ============================================================================
+
+// ---- Anexos (RFT-11) + versionamento simples de documento (RFT-10) ----------
+model Attachment {
+  id          String   @id @default(cuid())
+  recurso     String   // entidade dona, ex.: "Empenho", "Processo"
+  recursoId   String
+  nome        String   // nome original do arquivo
+  chave       String   // objeto no bucket S3/MinIO
+  mimeType    String
+  tamanho     Int
+  versao      Int      @default(1)
+
+  uploadPorId String?
+  uploadPor   User?    @relation(fields: [uploadPorId], references: [id])
+
+  createdAt   DateTime @default(now())
+  deletedAt   DateTime?
+
+  @@index([recurso, recursoId])
+  @@map("attachments")
+}
+
+// ---- Notificações (RFT-3) ---------------------------------------------------
+enum TipoNotificacao { INFO SUCESSO ALERTA ERRO TAREFA }
+
+model Notification {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id])
+  tipo      TipoNotificacao @default(INFO)
+  titulo    String
+  mensagem  String
+  link      String?
+  lidaEm    DateTime?
+  createdAt DateTime @default(now())
+
+  @@index([userId, lidaEm])
+  @@map("notifications")
+}
+
+// ---- Workflow configurável (RFT-8) ------------------------------------------
+enum StatusWorkflow { EM_ANDAMENTO APROVADO REPROVADO CANCELADO }
+
+model WorkflowDefinition {
+  id         String   @id @default(cuid())
+  chave      String   @unique // ex.: "ferias", "empenho", "processo"
+  nome       String
+  ativo      Boolean  @default(true)
+  steps      WorkflowStep[]
+  instancias WorkflowInstance[]
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+  @@map("workflow_definitions")
+}
+
+model WorkflowStep {
+  id           String   @id @default(cuid())
+  definitionId String
+  definition   WorkflowDefinition @relation(fields: [definitionId], references: [id])
+  ordem        Int
+  nome         String
+  // papel responsável por aprovar esta etapa
+  roleId       String?
+  role         Role?    @relation(fields: [roleId], references: [id])
+  @@unique([definitionId, ordem])
+  @@map("workflow_steps")
+}
+
+model WorkflowInstance {
+  id             String   @id @default(cuid())
+  definitionId   String
+  definition     WorkflowDefinition @relation(fields: [definitionId], references: [id])
+  recurso        String   // entidade em tramitação
+  recursoId      String
+  stepAtualOrdem Int      @default(1)
+  status         StatusWorkflow @default(EM_ANDAMENTO)
+  transicoes     WorkflowTransition[]
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+  @@index([recurso, recursoId])
+  @@map("workflow_instances")
+}
+
+model WorkflowTransition {
+  id         String   @id @default(cuid())
+  instanceId String
+  instance   WorkflowInstance @relation(fields: [instanceId], references: [id])
+  deOrdem    Int
+  paraOrdem  Int?
+  acao       String   // "APROVAR" | "REPROVAR" | "CANCELAR"
+  porId      String?
+  por        User?    @relation(fields: [porId], references: [id])
+  comentario String?
+  createdAt  DateTime @default(now())
+  @@map("workflow_transitions")
+}
+
+// ============================================================================
+//  MÓDULO COMPRAS PÚBLICAS (Etapa 5) — Lei 14.133/2021
+//  Cadeia: Solicitação → Processo de Contratação → Contrato. Fornecedor é o
+//  cadastro mestre referenciado por processos e contratos.
+// ============================================================================
+
+model Fornecedor {
+  id              String   @id @default(cuid())
+  razaoSocial     String
+  nomeFantasia    String?
+  cnpj            String   @unique
+  email           String?
+  telefone        String?
+  // Regularidade (certidões) — simplificado nesta etapa
+  regularFiscal   Boolean  @default(false)
+  regularValidade DateTime?
+
+  processos       ProcessoContratacao[]
+  contratos       Contrato[]
+
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+  deletedAt       DateTime?
+  @@map("fornecedores")
+}
+
+enum StatusSolicitacao { RASCUNHO EM_APROVACAO APROVADA REPROVADA CONVERTIDA }
+
+model SolicitacaoCompra {
+  id            String   @id @default(cuid())
+  numero        String   @unique // ex.: "2026/000123"
+  objeto        String
+  justificativa String?
+  status        StatusSolicitacao @default(RASCUNHO)
+  valorEstimado Decimal? @db.Decimal(14, 2)
+
+  secretariaId  String
+  secretaria    Secretaria @relation(fields: [secretariaId], references: [id])
+  solicitanteId String?
+  solicitante   User?      @relation(fields: [solicitanteId], references: [id])
+
+  itens         SolicitacaoItem[]
+  processo      ProcessoContratacao?
+
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+  deletedAt     DateTime?
+  @@index([secretariaId])
+  @@map("solicitacoes_compra")
+}
+
+model SolicitacaoItem {
+  id            String   @id @default(cuid())
+  solicitacaoId String
+  solicitacao   SolicitacaoCompra @relation(fields: [solicitacaoId], references: [id])
+  descricao     String
+  unidade       String   // "UN", "CX", "KG"...
+  quantidade    Decimal  @db.Decimal(14, 3)
+  valorUnitario Decimal? @db.Decimal(14, 2)
+  @@map("solicitacao_itens")
+}
+
+// Modalidades da Lei 14.133/2021 + contratação direta (dispensa/inexigibilidade)
+enum ModalidadeContratacao { PREGAO CONCORRENCIA CONCURSO LEILAO DIALOGO_COMPETITIVO DISPENSA INEXIGIBILIDADE }
+enum StatusProcesso { ABERTO EM_ANDAMENTO HOMOLOGADO FRACASSADO DESERTO REVOGADO ANULADO }
+
+model ProcessoContratacao {
+  id                   String   @id @default(cuid())
+  numero               String   @unique
+  objeto               String
+  modalidade           ModalidadeContratacao
+  status               StatusProcesso @default(ABERTO)
+  valorEstimado        Decimal? @db.Decimal(14, 2)
+  valorHomologado      Decimal? @db.Decimal(14, 2)
+
+  solicitacaoId        String?  @unique
+  solicitacao          SolicitacaoCompra? @relation(fields: [solicitacaoId], references: [id])
+  fornecedorVencedorId String?
+  fornecedorVencedor   Fornecedor? @relation(fields: [fornecedorVencedorId], references: [id])
+  contrato             Contrato?
+
+  aberturaEm           DateTime?
+  homologadoEm         DateTime?
+  createdAt            DateTime @default(now())
+  updatedAt            DateTime @updatedAt
+  deletedAt            DateTime?
+  @@map("processos_contratacao")
+}
+
+enum SituacaoContrato { VIGENTE ENCERRADO RESCINDIDO SUSPENSO }
+
+model Contrato {
+  id           String   @id @default(cuid())
+  numero       String   @unique
+  objeto       String
+  valor        Decimal  @db.Decimal(14, 2)
+  dataInicio   DateTime
+  dataFim      DateTime
+  situacao     SituacaoContrato @default(VIGENTE)
+
+  fornecedorId String
+  fornecedor   Fornecedor @relation(fields: [fornecedorId], references: [id])
+  processoId   String?  @unique
+  processo     ProcessoContratacao? @relation(fields: [processoId], references: [id])
+
+  aditivos     ContratoAditivo[]
+
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+  deletedAt    DateTime?
+  @@map("contratos")
+}
+
+model ContratoAditivo {
+  id             String   @id @default(cuid())
+  contratoId     String
+  contrato       Contrato @relation(fields: [contratoId], references: [id])
+  tipo           String   // "PRAZO" | "VALOR" | "PRAZO_VALOR"
+  descricao      String
+  valorAcrescimo Decimal? @db.Decimal(14, 2)
+  novaDataFim    DateTime?
+  createdAt      DateTime @default(now())
+  @@map("contrato_aditivos")
+}
+
+// ============================================================================
+//  MÓDULO PROCESSO ELETRÔNICO (Etapa 6) — tramitação digital de processos
+//  Reaproveita anexos e notificações; assinatura eletrônica de base (hash),
+//  com caminho de produção via ICP-Brasil/gov.br a definir.
+// ============================================================================
+
+enum StatusProcessoEletronico { ABERTO EM_TRAMITACAO SOBRESTADO ARQUIVADO CONCLUIDO }
+
+model ProcessoEletronico {
+  id           String   @id @default(cuid())
+  numero       String   @unique // protocolo: "PROC-2026/000123"
+  assunto      String
+  descricao    String?
+  tipo         String   // categoria livre: "Requerimento", "Ofício", "Memorando"...
+  interessado  String   // nome do interessado (cidadão ou órgão)
+  status       StatusProcessoEletronico @default(ABERTO)
+  sigiloso     Boolean  @default(false)
+
+  setorAtualId  String?
+  setorAtual    Departamento? @relation("SetorAtual", fields: [setorAtualId], references: [id])
+  aberturaPorId String?
+  aberturaPor   User?    @relation(fields: [aberturaPorId], references: [id])
+
+  tramitacoes  TramitacaoProcesso[]
+  atos         AtoProcesso[]
+
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+  deletedAt    DateTime?
+  @@index([setorAtualId])
+  @@map("processos_eletronicos")
+}
+
+model TramitacaoProcesso {
+  id          String   @id @default(cuid())
+  processoId  String
+  processo    ProcessoEletronico @relation(fields: [processoId], references: [id])
+  deSetorId   String?
+  deSetor     Departamento? @relation("TramitacaoDe", fields: [deSetorId], references: [id])
+  paraSetorId String
+  paraSetor   Departamento  @relation("TramitacaoPara", fields: [paraSetorId], references: [id])
+  despacho    String?
+  porId       String?
+  por         User?    @relation(fields: [porId], references: [id])
+  createdAt   DateTime @default(now())
+  @@index([processoId])
+  @@map("tramitacoes_processo")
+}
+
+model AtoProcesso {
+  id             String   @id @default(cuid())
+  processoId     String
+  processo       ProcessoEletronico @relation(fields: [processoId], references: [id])
+  tipo           String   // "DESPACHO" | "PARECER"
+  conteudo       String
+  autorId        String?
+  autor          User?    @relation(fields: [autorId], references: [id])
+  // Assinatura eletrônica (base): hash do conteúdo assinado + carimbo de tempo.
+  assinadoEm     DateTime?
+  assinaturaHash String?
+  createdAt      DateTime @default(now())
+  @@index([processoId])
+  @@map("atos_processo")
+}
